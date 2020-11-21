@@ -1,1 +1,5 @@
 .idea
+*.pt
+*.jpg
+*.png
+.DS_Store
