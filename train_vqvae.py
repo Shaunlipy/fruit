@@ -13,6 +13,7 @@ from tqdm import tqdm
 from vqvae import VQVAE
 from scheduler import CycleScheduler
 import distributed as dist
+from dataset import ImageDataset
 
 
 def train(epoch, loader, model, optimizer, scheduler, device):
@@ -27,33 +28,31 @@ def train(epoch, loader, model, optimizer, scheduler, device):
     mse_sum = 0
     mse_n = 0
 
-    for i, (img, label) in enumerate(loader):
-        model.zero_grad()
+    for i, (img_x, img_y) in enumerate(loader):
+        # model.zero_grad()
+        img_x = img_x.to(device)
 
-        img = img.to(device)
-
-        out, latent_loss = model(img)
-        recon_loss = criterion(out, img)
+        out, latent_loss = model(img_x)
+        recon_loss = criterion(out, img_y)
         latent_loss = latent_loss.mean()
         loss = recon_loss + latent_loss_weight * latent_loss
-        loss.backward()
 
+        optimizer.zero_grad()
+        loss.backward()
         if scheduler is not None:
             scheduler.step()
         optimizer.step()
 
-        part_mse_sum = recon_loss.item() * img.shape[0]
-        part_mse_n = img.shape[0]
+        part_mse_sum = recon_loss.item() * img_x.shape[0]
+        part_mse_n = img_x.shape[0]
         comm = {"mse_sum": part_mse_sum, "mse_n": part_mse_n}
         comm = dist.all_gather(comm)
-
         for part in comm:
             mse_sum += part["mse_sum"]
             mse_n += part["mse_n"]
 
         if dist.is_primary():
             lr = optimizer.param_groups[0]["lr"]
-
             loader.set_description(
                 (
                     f"epoch: {epoch + 1}; mse: {recon_loss.item():.5f}; "
@@ -61,11 +60,9 @@ def train(epoch, loader, model, optimizer, scheduler, device):
                     f"lr: {lr:.5f}"
                 )
             )
-
             if i % 100 == 0:
                 model.eval()
-
-                sample = img[:sample_size]
+                sample = img_x[:sample_size]
 
                 with torch.no_grad():
                     out, _ = model(sample)
@@ -74,42 +71,22 @@ def train(epoch, loader, model, optimizer, scheduler, device):
                     torch.cat([sample, out], 0),
                     f"sample/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}.png",
                     nrow=sample_size,
-                    normalize=True,
-                    range=(-1, 1),
+                    # normalize=True,
+                    # range=(-1, 1),
                 )
 
                 model.train()
 
 
 def main(args):
-    device = "cuda"
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     args.distributed = dist.get_world_size() > 1
-
-    transform = transforms.Compose(
-        [
-            transforms.Resize(args.size),
-            transforms.CenterCrop(args.size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ]
-    )
-
-    dataset = datasets.ImageFolder(args.path, transform=transform)
+    dataset = ImageDataset(args.file, args.prefix, args.size)
     sampler = dist.data_sampler(dataset, shuffle=True, distributed=args.distributed)
     loader = DataLoader(
-        dataset, batch_size=128 // args.n_gpu, sampler=sampler, num_workers=2
+        dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4
     )
-
     model = VQVAE().to(device)
-
-    if args.distributed:
-        model = nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[dist.get_local_rank()],
-            output_device=dist.get_local_rank(),
-        )
-
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = None
     if args.sched == "cycle":
@@ -143,6 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--epoch", type=int, default=560)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--sched", type=str)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("path", type=str)
 
     args = parser.parse_args()
